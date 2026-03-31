@@ -8,8 +8,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
-      - key: PORT
-        value: "3000"
       - key: FIREBASE_PROJECT_ID
         value: tradr-483b9
       - key: MONO_SECRET_KEY

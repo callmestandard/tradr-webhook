@@ -16,7 +16,9 @@ function getDb() {
 function verifyWebhookSecret(req) {
   const expected = process.env.MONO_WEBHOOK_SECRET;
   if (!expected) return false;
-  return req.headers['mono-webhook-secret'] === expected;
+  const header = req.headers['mono-webhook-secret'];
+  if (header == null || header === '') return false;
+  return String(header).trim() === String(expected).trim();
 }
 
 function normalizeTransactionList(body) {
@@ -92,11 +94,15 @@ async function sendFcmToUser(userId, title, body, dataPayload = {}) {
     data[k] = String(v);
   });
 
-  await admin.messaging().send({
-    token,
-    notification: { title, body },
-    data,
-  });
+  try {
+    await admin.messaging().send({
+      token,
+      notification: { title, body },
+      data,
+    });
+  } catch (e) {
+    console.error('FCM send skipped:', e.message);
+  }
 }
 
 async function processAccountUpdatedWebhook(payload) {
@@ -106,7 +112,7 @@ async function processAccountUpdatedWebhook(payload) {
   if (event !== 'mono.events.account_updated') return;
 
   const account = payload?.data?.account;
-  const accountId = account?._id;
+  const accountId = account?._id != null ? String(account._id) : '';
   if (!accountId) return;
 
   const db = getDb();
