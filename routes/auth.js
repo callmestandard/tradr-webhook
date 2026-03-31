@@ -1,28 +1,21 @@
 // tradr-server/routes/auth.js
-// Handles OTP via Termii + Firebase custom token creation
-
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 const admin = require('../firebaseAdmin');
 
 const db = admin.firestore();
+const TERMII_BASE = 'https://v3.api.termii.com';
 
 // ─── SEND OTP ────────────────────────────────────────────
-// POST /auth/send-otp
-// Body: { phone: "+2348012345678" }
 router.post('/send-otp', async (req, res) => {
   try {
     const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number is required' });
 
-    if (!phone) {
-      return res.status(400).json({ error: 'Phone number is required' });
-    }
-
-    // Clean the phone number
     const cleanPhone = phone.replace(/\s/g, '');
 
-    // Generate 6-digit OTP
+    // Generate 6-digit OTP as fallback
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
     // Store OTP in Firestore with 5-minute expiry
@@ -30,52 +23,51 @@ router.post('/send-otp', async (req, res) => {
       code: otp,
       phone: cleanPhone,
       createdAt: Date.now(),
-      expiresAt: Date.now() + (5 * 60 * 1000), // 5 minutes
+      expiresAt: Date.now() + (5 * 60 * 1000),
       verified: false,
       attempts: 0,
     });
 
-    // Send OTP via Termii
+    // Send via Termii — correct endpoint and payload
+    const termiiPayload = {
+      api_key: process.env.TERMII_API_KEY,
+      message_type: 'NUMERIC',
+      to: cleanPhone,
+      from: process.env.TERMII_SENDER_ID || 'N-Alert',
+      channel: 'dnd',
+      pin_attempts: 3,
+      pin_time_to_live: 5,
+      pin_length: 6,
+      pin_placeholder: '< 1234 >',
+      message_text: 'Your TRADR verification code is < 1234 >. Valid for 5 minutes. Do not share.',
+      pin_type: 'NUMERIC',
+    };
+
+    console.log('Sending OTP to:', cleanPhone);
+    console.log('Using sender:', termiiPayload.from);
+
     const termiiResponse = await axios.post(
-      'https://v3.api.termii.com/api/sms/otp/send',
-      {
-        api_key: process.env.TERMII_API_KEY,
-        message_type: 'NUMERIC',
-        to: cleanPhone,
-        from: process.env.TERMII_SENDER_ID || 'TRADR',
-        channel: 'dnd', // DND route — guaranteed delivery on Nigerian numbers
-        pin_attempts: 3,
-        pin_time_to_live: 5,
-        pin_length: 6,
-        pin_placeholder: '< 1234 >',
-        message_text: 'Your TRADR verification code is < 1234 >. It expires in 5 minutes. Do not share this code with anyone.',
-        pin_type: 'NUMERIC',
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
+      `${TERMII_BASE}/api/sms/otp/send`,
+      termiiPayload,
+      { headers: { 'Content-Type': 'application/json' } }
     );
 
-    console.log('Termii response:', termiiResponse.data);
+    console.log('Termii response:', JSON.stringify(termiiResponse.data));
 
-    // Store Termii's pin_id for verification
-    if (termiiResponse.data.pinId) {
-      await db.collection('otps').doc(cleanPhone).update({
-        pinId: termiiResponse.data.pinId,
-      });
+    // Store pinId if Termii returns one
+    const pinId = termiiResponse.data?.pinId || termiiResponse.data?.pin_id || null;
+    if (pinId) {
+      await db.collection('otps').doc(cleanPhone).update({ pinId });
     }
 
     return res.json({
       success: true,
       message: 'OTP sent successfully',
-      // Return pinId to app for verification
-      pinId: termiiResponse.data.pinId,
+      pinId,
     });
 
   } catch (e) {
-    console.error('Send OTP error:', e.response?.data || e.message);
+    console.error('Send OTP error:', JSON.stringify(e.response?.data || e.message));
     return res.status(500).json({
       error: 'Could not send OTP',
       details: e.response?.data || e.message,
@@ -84,21 +76,15 @@ router.post('/send-otp', async (req, res) => {
 });
 
 // ─── VERIFY OTP ──────────────────────────────────────────
-// POST /auth/verify-otp
-// Body: { phone: "+2348012345678", code: "123456", pinId: "xxx" }
 router.post('/verify-otp', async (req, res) => {
   try {
     const { phone, code, pinId } = req.body;
-
-    if (!phone || !code) {
-      return res.status(400).json({ error: 'Phone and code are required' });
-    }
+    if (!phone || !code) return res.status(400).json({ error: 'Phone and code are required' });
 
     const cleanPhone = phone.replace(/\s/g, '');
 
-    // Get stored OTP from Firestore
+    // Get stored OTP
     const otpDoc = await db.collection('otps').doc(cleanPhone).get();
-
     if (!otpDoc.exists) {
       return res.status(400).json({ error: 'No OTP found. Please request a new one.' });
     }
@@ -114,67 +100,60 @@ router.post('/verify-otp', async (req, res) => {
     // Check attempts
     if (otpData.attempts >= 3) {
       await db.collection('otps').doc(cleanPhone).delete();
-      return res.status(400).json({ error: 'Too many attempts. Please request a new OTP.' });
+      return res.status(400).json({ error: 'Too many wrong attempts. Please request a new OTP.' });
     }
 
     // Increment attempts
-    await db.collection('otps').doc(cleanPhone).update({
-      attempts: otpData.attempts + 1,
-    });
+    await db.collection('otps').doc(cleanPhone).update({ attempts: otpData.attempts + 1 });
 
-    // Verify via Termii if pinId exists
-    if (pinId || otpData.pinId) {
+    // Try Termii verification first
+    const usePinId = pinId || otpData.pinId;
+    let verified = false;
+
+    if (usePinId) {
       try {
         const verifyResponse = await axios.post(
-          'https://v3.api.termii.com/api/sms/otp/verify',
+          `${TERMII_BASE}/api/sms/otp/verify`,
           {
             api_key: process.env.TERMII_API_KEY,
-            pin_id: pinId || otpData.pinId,
+            pin_id: usePinId,
             pin: code,
           },
           { headers: { 'Content-Type': 'application/json' } }
         );
-
-        console.log('Termii verify response:', verifyResponse.data);
-
-        if (verifyResponse.data.verified !== true) {
-          return res.status(400).json({ error: 'Wrong code. Please try again.' });
-        }
+        console.log('Termii verify:', JSON.stringify(verifyResponse.data));
+        verified = verifyResponse.data?.verified === true;
       } catch (termiiError) {
         console.error('Termii verify error:', termiiError.response?.data);
-        // Fall back to local verification if Termii fails
-        if (otpData.code !== code) {
-          return res.status(400).json({ error: 'Wrong code. Please try again.' });
-        }
+        // Fall back to local code check
+        verified = otpData.code === code;
       }
     } else {
-      // Local verification fallback
-      if (otpData.code !== code) {
-        return res.status(400).json({ error: 'Wrong code. Please try again.' });
-      }
+      // Local verification only
+      verified = otpData.code === code;
     }
 
-    // OTP is valid — clean up
+    if (!verified) {
+      return res.status(400).json({ error: 'Wrong code. Please try again.' });
+    }
+
+    // Clean up used OTP
     await db.collection('otps').doc(cleanPhone).delete();
 
-    // Create or get Firebase user for this phone number
+    // Get or create Firebase user
     let uid;
     try {
-      // Check if user already exists
       const existingUser = await admin.auth().getUserByPhoneNumber(cleanPhone);
       uid = existingUser.uid;
+      console.log('Existing user found:', uid);
     } catch (e) {
-      // User doesn't exist — create them
-      const newUser = await admin.auth().createUser({
-        phoneNumber: cleanPhone,
-      });
+      const newUser = await admin.auth().createUser({ phoneNumber: cleanPhone });
       uid = newUser.uid;
+      console.log('New user created:', uid);
     }
 
-    // Create a Firebase custom token
-    const customToken = await admin.auth().createCustomToken(uid, {
-      phone: cleanPhone,
-    });
+    // Create Firebase custom token
+    const customToken = await admin.auth().createCustomToken(uid);
 
     return res.json({
       success: true,
@@ -185,31 +164,29 @@ router.post('/verify-otp', async (req, res) => {
 
   } catch (e) {
     console.error('Verify OTP error:', e.message);
-    return res.status(500).json({
-      error: 'Verification failed',
-      details: e.message,
-    });
+    return res.status(500).json({ error: 'Verification failed', details: e.message });
   }
 });
 
 // ─── RESEND OTP ──────────────────────────────────────────
-// POST /auth/resend-otp
-// Body: { phone: "+2348012345678" }
 router.post('/resend-otp', async (req, res) => {
   try {
     const { phone } = req.body;
-    const cleanPhone = phone.replace(/\s/g, '');
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
 
     // Delete existing OTP
-    await db.collection('otps').doc(cleanPhone).delete();
+    await db.collection('otps').doc(phone.replace(/\s/g, '')).delete();
 
-    // Forward to send-otp logic
-    req.body.phone = cleanPhone;
-    return router.handle(
-      { ...req, url: '/send-otp', method: 'POST' },
-      res,
-      () => {}
-    );
+    // Reuse send-otp logic by making internal call
+    const sendReq = { body: { phone } };
+    const sendRes = {
+      json: (data) => res.json(data),
+      status: (code) => ({ json: (data) => res.status(code).json(data) }),
+    };
+
+    // Manually call send-otp handler
+    req.body = { phone };
+    return router.handle(req, res, () => {});
   } catch (e) {
     return res.status(500).json({ error: 'Could not resend OTP' });
   }
