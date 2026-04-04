@@ -21,11 +21,14 @@ function normalizePhone(phone) {
 }
 
 async function sendTermiiOTP(phone, code) {
+  const from = process.env.TERMII_SENDER_ID;
+  const channel = process.env.TERMII_CHANNEL || 'generic';
   const payload = {
     to: phone,
+    from,
     sms: `Your TRADR verification code is ${code}. It expires in 5 minutes. Do not share this with anyone.`,
     type: "plain",
-    channel: "generic",
+    channel,
     api_key: process.env.TERMII_API_KEY,
   };
 
@@ -48,6 +51,15 @@ async function sendOtpHandler(req, res) {
       return res.status(503).json({
         error: 'SMS is not configured',
         details: 'Set TERMII_API_KEY on the server.',
+      });
+    }
+
+    if (!process.env.TERMII_SENDER_ID) {
+      console.error('TERMII_SENDER_ID is not set');
+      return res.status(503).json({
+        error: 'SMS is not configured',
+        details:
+          'Set TERMII_SENDER_ID to a sender ID approved in your Termii dashboard (not N-Alert unless that sender is registered for your account).',
       });
     }
 
