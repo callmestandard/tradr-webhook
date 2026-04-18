@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const monoRoutes = require('./routes/mono');
 const authRoutes = require('./routes/auth');
+const loanRoutes = require('./routes/loans');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,6 +19,7 @@ app.get('/', (req, res) => {
 // Routes
 app.use('/mono', monoRoutes);
 app.use('/auth', authRoutes);
+app.use('/loan', loanRoutes);
 
 app.listen(PORT, () => {
   console.log(`TRADR server listening on port ${PORT}`);
