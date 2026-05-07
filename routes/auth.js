@@ -1,76 +1,101 @@
+// tradr-server/routes/auth.js
 const express = require('express');
 const router = express.Router();
-const axios = require('axios');
 const admin = require('../firebaseAdmin');
+const AfricasTalking = require('africastalking');
 
 const db = admin.firestore();
-const OTP_EXPIRY_MS = 10 * 60 * 1000;
 
-async function sendSms(to, message) {
-  const apiKey   = process.env.AT_API_KEY;
-  const username = process.env.AT_USERNAME;
-  const senderId = process.env.AT_SENDER_ID || '';
-
-  if (!apiKey || !username) throw new Error('Africa\'s Talking credentials not configured');
-
-  const params = new URLSearchParams();
-  params.append('username', username);
-  params.append('to', to);
-  params.append('message', message);
-  if (senderId) params.append('from', senderId);
-
-  const { data } = await axios.post(
-    'https://api.africastalking.com/version1/messaging',
-    params.toString(),
-    {
-      headers: {
-        apiKey,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-      },
-      timeout: 10000,
-    }
-  );
-
-  const recipient = data?.SMSMessageData?.Recipients?.[0];
-  if (!recipient || recipient.status !== 'Success') {
-    throw new Error(recipient?.status || 'SMS delivery failed');
-  }
+function getAT() {
+  return AfricasTalking({
+    apiKey: process.env.AT_API_KEY,
+    username: process.env.AT_USERNAME,
+  });
 }
 
-// ─── SEND OTP ────────────────────────────────────────────
-router.post('/send-otp', async (req, res) => {
+function cleanPhoneKey(phone) {
+  return String(phone).replace(/\s/g, '');
+}
+
+/** E.164 for Firebase (+234…) and Africa's Talking (+234…). */
+function normalizePhone(phone) {
+  const raw = cleanPhoneKey(phone);
+  const digits = raw.replace(/\D/g, '');
+  let n = digits;
+  if (n.startsWith('0')) n = '234' + n.slice(1);
+  if (!n.startsWith('234')) n = '234' + n;
+  return { phoneE164: `+${n}` };
+}
+
+async function sendSmsOTP(phone, code) {
+  const sms = getAT().SMS;
+  const result = await sms.send({
+    to: [phone],
+    message: `Your TRADR verification code is ${code}. It expires in 5 minutes. Do not share this with anyone.`,
+    from: process.env.AT_SENDER_ID || undefined,
+  });
+
+  const recipient = result.SMSMessageData?.Recipients?.[0];
+  if (!recipient || recipient.statusCode !== 101) {
+    throw new Error(recipient?.status || 'SMS failed to send');
+  }
+
+  return result;
+}
+
+async function sendOtpHandler(req, res) {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
 
-    const cleanPhone = phone.replace(/\s/g, '');
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    if (!process.env.AT_API_KEY || !process.env.AT_USERNAME) {
+      console.error('Africa\'s Talking credentials not set');
+      return res.status(503).json({
+        error: 'SMS is not configured',
+        details: 'Set AT_API_KEY and AT_USERNAME on the server.',
+      });
+    }
 
-    await db.collection('otps').doc(cleanPhone).set({
-      code: otp,
-      phone: cleanPhone,
+    const { phoneE164 } = normalizePhone(phone);
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+    console.log("Sending OTP to:", phoneE164);
+
+    await sendSmsOTP(phoneE164, code);
+
+    await db.collection('otps').doc(phoneE164).set({
+      phone: phoneE164,
+      code,
       createdAt: Date.now(),
-      expiresAt: Date.now() + OTP_EXPIRY_MS,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      verified: false,
       attempts: 0,
     });
 
-    try {
-      await sendSms(
-        cleanPhone,
-        `TRADR: Your verification code is ${otp}. Expires in 10 minutes. Do not share this code.`
-      );
-      console.log(`OTP sent via Africa's Talking to ${cleanPhone}`);
-    } catch (smsError) {
-      console.error('SMS send failed:', smsError.response?.data || smsError.message);
-      return res.status(502).json({ error: 'Could not send SMS. Please try again shortly.' });
-    }
-
-    return res.json({ success: true });
-
+    return res.json({
+      success: true,
+      message: 'OTP sent successfully',
+      pinId: null,
+    });
   } catch (e) {
-    console.error('Send OTP error:', e.message);
-    return res.status(500).json({ error: 'Could not send OTP', details: e.message });
+    console.error('Send OTP error:', JSON.stringify(e.response?.data || e.message));
+    return res.status(500).json({
+      error: 'Could not send OTP',
+      details: e.response?.data || e.message,
+    });
+  }
+}
+
+router.post('/send-otp', sendOtpHandler);
+
+router.post('/resend-otp', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone required' });
+    await db.collection('otps').doc(cleanPhoneKey(phone)).delete().catch(() => {});
+    return sendOtpHandler(req, res);
+  } catch (e) {
+    return res.status(500).json({ error: 'Could not resend OTP' });
   }
 });
 
@@ -78,13 +103,11 @@ router.post('/send-otp', async (req, res) => {
 router.post('/verify-otp', async (req, res) => {
   try {
     const { phone, code } = req.body;
-    if (!phone || !code) {
-      return res.status(400).json({ error: 'Phone and code are required' });
-    }
+    if (!phone || !code) return res.status(400).json({ error: 'Phone and code are required' });
 
-    const cleanPhone = phone.replace(/\s/g, '');
-    const otpDoc = await db.collection('otps').doc(cleanPhone).get();
+    const { phoneE164 } = normalizePhone(phone);
 
+    const otpDoc = await db.collection('otps').doc(phoneE164).get();
     if (!otpDoc.exists) {
       return res.status(400).json({ error: 'No OTP found. Please request a new one.' });
     }
@@ -92,36 +115,44 @@ router.post('/verify-otp', async (req, res) => {
     const otpData = otpDoc.data();
 
     if (Date.now() > otpData.expiresAt) {
-      await db.collection('otps').doc(cleanPhone).delete();
-      return res.status(400).json({ error: 'Code has expired. Please request a new one.' });
+      await db.collection('otps').doc(phoneE164).delete();
+      return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
     }
 
-    if (otpData.attempts >= 5) {
-      await db.collection('otps').doc(cleanPhone).delete();
-      return res.status(400).json({ error: 'Too many wrong attempts. Please request a new code.' });
+    if (otpData.attempts >= 3) {
+      await db.collection('otps').doc(phoneE164).delete();
+      return res.status(400).json({ error: 'Too many wrong attempts. Please request a new OTP.' });
     }
 
-    await db.collection('otps').doc(cleanPhone).update({ attempts: otpData.attempts + 1 });
+    await db.collection('otps').doc(phoneE164).update({ attempts: otpData.attempts + 1 });
 
-    if (otpData.code !== code) {
+    const verified = String(otpData.code) === String(code).trim();
+
+    if (!verified) {
       return res.status(400).json({ error: 'Wrong code. Please try again.' });
     }
 
-    await db.collection('otps').doc(cleanPhone).delete();
+    await db.collection('otps').doc(phoneE164).delete();
 
     let uid;
     try {
-      const existing = await admin.auth().getUserByPhoneNumber(cleanPhone);
-      uid = existing.uid;
-    } catch {
-      const created = await admin.auth().createUser({ phoneNumber: cleanPhone });
-      uid = created.uid;
+      const existingUser = await admin.auth().getUserByPhoneNumber(phoneE164);
+      uid = existingUser.uid;
+      console.log('Existing user found:', uid);
+    } catch (e) {
+      const newUser = await admin.auth().createUser({ phoneNumber: phoneE164 });
+      uid = newUser.uid;
+      console.log('New user created:', uid);
     }
 
     const customToken = await admin.auth().createCustomToken(uid);
 
-    return res.json({ success: true, token: customToken, uid, phone: cleanPhone });
-
+    return res.json({
+      success: true,
+      token: customToken,
+      uid,
+      phone: phoneE164,
+    });
   } catch (e) {
     console.error('Verify OTP error:', e.message);
     return res.status(500).json({ error: 'Verification failed', details: e.message });

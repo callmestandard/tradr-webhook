@@ -155,6 +155,262 @@ function buildMorningMessage(trader, { publicScore, tier, totalDaysRecording, tr
   return msg;
 }
 
+// ─── STAGE 2: ML FEATURE LOGGING ────────────────────────────────────────────
+
+async function logMLFeatures(db, userId, transactions, score, today) {
+  const now = Date.now();
+
+  const last30 = Array.from({ length: 30 }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - i); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  });
+  const daysActive = last30.filter(day =>
+    transactions.some(t => t.createdAt >= day && t.createdAt < day + 86400000)
+  ).length;
+  const recordingConsistency = daysActive / 30;
+
+  const last60Start = now - 60 * 86400000;
+  const recentSales = transactions.filter(t => t.type === 'sale' && t.createdAt >= last60Start);
+  const digitalSales = recentSales.filter(t =>
+    ['moniepoint', 'opay', 'palmpay', 'transfer', 'kuda'].includes(
+      (t.paymentMethod || '').toLowerCase()
+    ) || t.source === 'sms_auto'
+  );
+  const digitalPaymentRatio = recentSales.length > 0 ? digitalSales.length / recentSales.length : 0;
+
+  const weeklyTotals = [];
+  for (let i = 0; i < 8; i++) {
+    const start = now - (i + 1) * 7 * 86400000;
+    const end = now - i * 7 * 86400000;
+    weeklyTotals.push(
+      transactions.filter(t => t.type === 'sale' && t.createdAt >= start && t.createdAt < end)
+        .reduce((s, t) => s + (t.amount || 0), 0)
+    );
+  }
+  const mean8 = weeklyTotals.reduce((a, b) => a + b, 0) / 8;
+  const variance8 = weeklyTotals.reduce((s, v) => s + Math.pow(v - mean8, 2), 0) / 8;
+  const incomeVolatility = mean8 > 0 ? Math.sqrt(variance8) / mean8 : 1;
+
+  const last30Start = now - 30 * 86400000;
+  const monthlyRevenue = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= last30Start)
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const monthlyExpenses = transactions
+    .filter(t => t.type === 'expense' && t.createdAt >= last30Start)
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const expenseRatio = monthlyRevenue > 0 ? monthlyExpenses / monthlyRevenue : 0;
+
+  const startOfThisMonth = new Date();
+  startOfThisMonth.setDate(1); startOfThisMonth.setHours(0, 0, 0, 0);
+  const startOfLastMonth = new Date(startOfThisMonth);
+  startOfLastMonth.setMonth(startOfLastMonth.getMonth() - 1);
+  const thisMonthRev = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= startOfThisMonth.getTime())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const lastMonthRev = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= startOfLastMonth.getTime() && t.createdAt < startOfThisMonth.getTime())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const revenueGrowth = lastMonthRev > 0 ? (thisMonthRev - lastMonthRev) / lastMonthRev : 0;
+
+  const totalSales = transactions.filter(t => t.type === 'sale').length;
+  const txFrequency = daysActive > 0 ? totalSales / daysActive : 0;
+  const firstTx = transactions.length > 0 ? Math.min(...transactions.map(t => t.createdAt)) : now;
+  const daysSinceFirst = Math.floor((now - firstTx) / 86400000);
+  const avgTransactionSize = recentSales.length > 0
+    ? recentSales.reduce((s, t) => s + (t.amount || 0), 0) / recentSales.length : 0;
+
+  await db.collection('ml_features').doc(userId).collection('daily').doc(today).set({
+    userId,
+    date: today,
+    timestamp: now,
+    tradrScore: score,
+    features: {
+      recordingConsistency, digitalPaymentRatio, incomeVolatility,
+      monthlyRevenue, expenseRatio, revenueGrowth,
+      txFrequency, daysSinceFirst, avgTransactionSize, daysActive, weeklyTotals,
+    },
+    loanOutcome: null,
+  });
+  console.log(`[ml] Features logged for ${userId} on ${today}`);
+}
+
+// ─── STAGE 6: ML SERVICE INTEGRATION ───────────────────────────────────────
+
+async function callMLService(db, userId, transactions, ruleBasedScore, today) {
+  const ML_URL = process.env.ML_SERVICE_URL;
+  if (!ML_URL) return; // not configured — skip silently
+
+  const now = Date.now();
+  const last30Start = now - 30 * 86400000;
+  const last60Start = now - 60 * 86400000;
+
+  const recentSales = transactions.filter(t => t.type === 'sale' && t.createdAt >= last60Start);
+  const digitalSales = recentSales.filter(t =>
+    ['moniepoint', 'opay', 'palmpay', 'transfer', 'kuda'].includes(
+      (t.paymentMethod || '').toLowerCase()
+    ) || t.source === 'sms_auto'
+  );
+
+  const last30 = Array.from({ length: 30 }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - i); d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  });
+  const daysActive = last30.filter(day =>
+    transactions.some(t => t.createdAt >= day && t.createdAt < day + 86400000)
+  ).length;
+
+  const monthlyRevenue = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= last30Start)
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const monthlyExpenses = transactions
+    .filter(t => t.type === 'expense' && t.createdAt >= last30Start)
+    .reduce((s, t) => s + (t.amount || 0), 0);
+
+  const weeklyTotals = [];
+  for (let i = 0; i < 8; i++) {
+    const start = now - (i + 1) * 7 * 86400000;
+    const end = now - i * 7 * 86400000;
+    weeklyTotals.push(
+      transactions.filter(t => t.type === 'sale' && t.createdAt >= start && t.createdAt < end)
+        .reduce((s, t) => s + (t.amount || 0), 0)
+    );
+  }
+  const mean8 = weeklyTotals.reduce((a, b) => a + b, 0) / 8;
+  const variance8 = weeklyTotals.reduce((s, v) => s + Math.pow(v - mean8, 2), 0) / 8;
+  const incomeVolatility = mean8 > 0 ? Math.sqrt(variance8) / mean8 : 1;
+
+  const firstTx = transactions.length > 0 ? Math.min(...transactions.map(t => t.createdAt)) : now;
+  const daysSinceFirst = Math.floor((now - firstTx) / 86400000);
+  const avgTxSize = recentSales.length > 0
+    ? recentSales.reduce((s, t) => s + (t.amount || 0), 0) / recentSales.length : 0;
+
+  const startOfThisMonth = new Date();
+  startOfThisMonth.setDate(1); startOfThisMonth.setHours(0, 0, 0, 0);
+  const startOfLastMonth = new Date(startOfThisMonth);
+  startOfLastMonth.setMonth(startOfLastMonth.getMonth() - 1);
+  const thisMonthRev = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= startOfThisMonth.getTime())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const lastMonthRev = transactions
+    .filter(t => t.type === 'sale' && t.createdAt >= startOfLastMonth.getTime() && t.createdAt < startOfThisMonth.getTime())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const revenueGrowth = lastMonthRev > 0 ? (thisMonthRev - lastMonthRev) / lastMonthRev : 0;
+
+  const response = await fetch(`${ML_URL}/score`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      userId,
+      recordingConsistency: daysActive / 30,
+      digitalPaymentRatio: recentSales.length > 0 ? digitalSales.length / recentSales.length : 0,
+      incomeVolatility,
+      monthlyRevenue,
+      expenseRatio: monthlyRevenue > 0 ? monthlyExpenses / monthlyRevenue : 0,
+      revenueGrowth,
+      txFrequency: daysActive > 0 ? transactions.filter(t => t.type === 'sale').length / daysActive : 0,
+      daysSinceFirst,
+      avgTransactionSize: avgTxSize,
+      daysActive,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`ML service returned ${response.status}`);
+  }
+
+  const mlResult = await response.json();
+  const mlScore = mlResult.tradrScore || 0;
+  const divergence = Math.abs(mlScore - ruleBasedScore);
+
+  await db.collection('ml_features').doc(userId).collection('daily').doc(today)
+    .set({ mlScore, mlDivergence: divergence, mlFlagged: divergence > 50 }, { merge: true });
+
+  if (divergence > 50) {
+    console.log(`[ml] Score divergence flagged for ${userId}: rule=${ruleBasedScore}, ml=${mlScore}, gap=${divergence}`);
+  }
+}
+
+// ─── STAGE 4: LOAN REPAYMENT TRACKING ───────────────────────────────────────
+
+async function sendRepaymentReminder(db, userId, loanData) {
+  const trader = (await db.doc(`traders/${userId}`).get()).data() || {};
+  if (!trader.whatsappNumber) return;
+  await sendWhatsAppMessage(trader.whatsappNumber,
+    `Hello ${trader.businessName || 'Trader'}, your loan repayment of ${fmt(loanData.monthlyRepayment || 0)} is due today. Please contact your loan officer to make payment. — TRADR`
+  );
+}
+
+async function sendOverdueAlert(db, userId, loanData, daysOverdue) {
+  const trader = (await db.doc(`traders/${userId}`).get()).data() || {};
+  if (!trader.whatsappNumber) return;
+  await sendWhatsAppMessage(trader.whatsappNumber,
+    `URGENT — ${trader.businessName || 'Trader'}, your loan repayment of ${fmt(loanData.monthlyRepayment || 0)} is ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue. Please contact your loan officer immediately. — TRADR`
+  );
+}
+
+async function sendRepaymentPrompt(db, userId, loanData) {
+  const trader = (await db.doc(`traders/${userId}`).get()).data() || {};
+  if (!trader.whatsappNumber) return;
+  await sendWhatsAppMessage(trader.whatsappNumber,
+    `Great sales today ${trader.businessName || 'Trader'}! Remember your loan repayment of ${fmt(loanData.monthlyRepayment || 0)}/month — staying current builds your TRADR credit history. — TRADR`
+  );
+}
+
+async function flagForMFB(db, userId, loanData, repayment) {
+  await db.collection('mfb_flags').add({
+    userId,
+    loanId: loanData.id,
+    type: 'OVERDUE_7_PLUS',
+    repaymentAmount: repayment.amount || loanData.monthlyRepayment || 0,
+    flaggedAt: Date.now(),
+    status: 'open',
+  });
+  console.log(`[agent] MFB overdue flag raised for ${userId}`);
+}
+
+async function checkLoanRepayments(db, userId, todayRevenue, today) {
+  const loansSnap = await db.collection('loanApplications')
+    .where('userId', '==', userId)
+    .where('status', '==', 'approved')
+    .get();
+
+  for (const loanDoc of loansSnap.docs) {
+    const loanData = { id: loanDoc.id, ...loanDoc.data() };
+    try {
+      const repaySnap = await db.collection('loan_repayments')
+        .doc(loanDoc.id).collection('schedule')
+        .where('status', '==', 'pending')
+        .where('dueDate', '<=', Date.now())
+        .limit(1).get();
+
+      if (!repaySnap.empty) {
+        const repayment = repaySnap.docs[0].data();
+        const daysOverdue = Math.floor((Date.now() - repayment.dueDate) / 86400000);
+
+        if (daysOverdue === 0) {
+          await sendRepaymentReminder(db, userId, loanData);
+        } else if (daysOverdue > 0 && daysOverdue <= 3) {
+          await sendOverdueAlert(db, userId, loanData, daysOverdue);
+        } else if (daysOverdue > 7) {
+          await flagForMFB(db, userId, loanData, repayment);
+        }
+
+        if (daysOverdue >= 90) {
+          await db.collection('ml_features').doc(userId)
+            .collection('daily').doc(today)
+            .set({ loanOutcome: 'defaulted' }, { merge: true });
+        }
+      }
+
+      if (todayRevenue > (loanData.monthlyRepayment || 0) * 1.5) {
+        await sendRepaymentPrompt(db, userId, loanData);
+      }
+    } catch (e) {
+      console.error(`[agent] Repayment check error for loan ${loanData.id}:`, e.message);
+    }
+  }
+}
+
 async function runNightlyAgent() {
   if (!admin.apps.length) {
     console.log('[agent] Firebase not initialised — skipping nightly run');
@@ -191,6 +447,31 @@ async function runNightlyAgent() {
       // Calculate score
       const { publicScore, totalDaysRecording, daysWithActivity } = calcScore(transactions, contacts);
       const tier = getTier(publicScore);
+
+      // Stage 2: Log ML features (non-fatal)
+      try {
+        await logMLFeatures(db, userId, transactions, publicScore, today);
+      } catch (e) {
+        console.error(`[ml] Feature logging failed for ${userId}:`, e.message);
+      }
+
+      // Stage 6: Call Python ML service for secondary score (non-fatal)
+      try {
+        await callMLService(db, userId, transactions, publicScore, today);
+      } catch (e) {
+        console.error(`[ml] ML service call failed for ${userId}:`, e.message);
+      }
+
+      // Stage 4: Check loan repayments (non-fatal)
+      const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+      const todayRevenue = transactions
+        .filter(t => t.type === 'sale' && t.createdAt >= todayStart.getTime())
+        .reduce((s, t) => s + (t.amount || 0), 0);
+      try {
+        await checkLoanRepayments(db, userId, todayRevenue, today);
+      } catch (e) {
+        console.error(`[agent] Repayment check failed for ${userId}:`, e.message);
+      }
 
       // Get previous score
       const prevRunSnap = await db.collection(`nightly_runs/${userId}`)

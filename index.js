@@ -11,6 +11,8 @@ const assistantRoutes = require('./routes/assistant');
 const debtAgentRoutes = require('./routes/debtAgent');
 const bureauRoutes = require('./routes/bureau');
 const accountRoutes = require('./routes/account');
+const mfbRoutes = require('./routes/mfb');
+const supplyChainRoutes = require('./routes/supplyChain');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,6 +34,8 @@ app.use('/assistant', assistantRoutes);
 app.use('/debt', debtAgentRoutes);
 app.use('/bureau', bureauRoutes);
 app.use('/account', accountRoutes);
+app.use('/mfb', mfbRoutes);
+app.use('/supply', supplyChainRoutes);
 
 // Nightly agent — midnight Lagos time
 cron.schedule('0 0 * * *', async () => {
