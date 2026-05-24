@@ -105,6 +105,37 @@ async function sendFcmToUser(userId, title, body, dataPayload = {}) {
   }
 }
 
+async function seedHistoricalTransactions(accountId, userId) {
+  const db = getDb();
+  const bankName = await fetchAccountBankName(accountId);
+  const transactions = await fetchMonoTransactions(accountId);
+
+  for (const tx of transactions) {
+    const type = (tx.type || '').toLowerCase();
+    if (type !== 'credit') continue;
+
+    const monoTransactionId = String(tx.id || tx._id || '');
+    if (!monoTransactionId) continue;
+
+    if (await monoTransactionExists(db, monoTransactionId)) continue;
+
+    const amountNaira = (tx.amount || 0) / 100;
+
+    await db.collection('pending_transactions').add({
+      userId,
+      amount: amountNaira,
+      date: tx.date || new Date().toISOString(),
+      narration: tx.narration || '',
+      type: 'credit',
+      source: 'mono_auto',
+      status: 'pending',
+      bankName: bankName || '',
+      createdAt: Date.now(),
+      monoTransactionId,
+    });
+  }
+}
+
 async function processAccountUpdatedWebhook(payload) {
   if (!admin.apps.length) return;
 
@@ -225,7 +256,10 @@ router.post('/exchange-token', async (req, res) => {
         { merge: true }
       );
 
-    return res.json({ success: true, accountId: String(accountId) });
+    res.json({ success: true, accountId: String(accountId) });
+
+    seedHistoricalTransactions(String(accountId), String(userId))
+      .catch(err => console.error('Mono seed error:', err.message));
   } catch (err) {
     const msg =
       err.response?.data?.message || err.message || 'Exchange failed';
