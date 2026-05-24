@@ -28,18 +28,39 @@ router.post('/verify-bvn', async (req, res) => {
     const result = await zeehPost('/identity/bvn', { bvn, firstName, lastName, dob });
 
     const db = admin.firestore();
+    const verifiedName = result.data?.fullName || `${result.data?.firstName || ''} ${result.data?.lastName || ''}`.trim();
+
     await db.collection('traders').doc(userId).set({
       bvn: bvn.substring(0, 3) + '****' + bvn.substring(7), // masked
       bvnVerified: true,
       bvnVerifiedAt: admin.firestore.FieldValue.serverTimestamp(),
       bvnData: {
-        name: result.data?.fullName || `${result.data?.firstName} ${result.data?.lastName}`,
+        name: verifiedName,
         phone: result.data?.phone,
         gender: result.data?.gender,
       },
     }, { merge: true });
 
-    res.json({ success: true, name: result.data?.fullName });
+    res.json({ success: true, name: verifiedName });
+
+    // Fire-and-forget credit check while we still have the BVN
+    zeehPost('/credit/basic', { bvn })
+      .then(async (creditResult) => {
+        const creditData = {
+          totalLoans: creditResult.data?.totalLoans || 0,
+          activeLoans: creditResult.data?.activeLoans || 0,
+          overdueLoans: creditResult.data?.overdueLoans || 0,
+          creditScore: creditResult.data?.creditScore || null,
+          checkedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        await db.collection('traders').doc(userId).set({ creditData }, { merge: true });
+        const today = new Date().toISOString().split('T')[0];
+        await db.collection('ml_features').doc(userId)
+          .collection('daily').doc(today)
+          .set({ bureauScore: creditData.creditScore || 0 }, { merge: true })
+          .catch(() => {});
+      })
+      .catch(err => console.warn('[bureau] Credit check after BVN verify failed:', err.message));
   } catch (e) {
     console.error('[bureau] BVN verify error:', e.message);
     res.status(400).json({ error: e.message });
@@ -64,6 +85,16 @@ router.post('/credit-check', async (req, res) => {
 
     const db = admin.firestore();
     await db.collection('traders').doc(userId).set({ creditData }, { merge: true });
+
+    // Tag today's ML feature snapshot with the fresh bureau score
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      await db.collection('ml_features').doc(userId)
+        .collection('daily').doc(today)
+        .set({ bureauScore: creditData.creditScore || 0 }, { merge: true });
+    } catch (e) {
+      console.warn('[bureau] ML feature bureau tag failed:', e.message);
+    }
 
     res.json({ success: true, creditData });
   } catch (e) {
