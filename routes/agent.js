@@ -236,7 +236,7 @@ async function logMLFeatures(db, userId, transactions, score, today) {
 
 // ─── STAGE 6: ML SERVICE INTEGRATION ───────────────────────────────────────
 
-async function callMLService(db, userId, transactions, ruleBasedScore, today) {
+async function callMLService(db, userId, transactions, ruleBasedScore, today, trader = {}) {
   const ML_URL = process.env.ML_SERVICE_URL;
   if (!ML_URL) return; // not configured — skip silently
 
@@ -311,6 +311,8 @@ async function callMLService(db, userId, transactions, ruleBasedScore, today) {
       daysSinceFirst,
       avgTransactionSize: avgTxSize,
       daysActive,
+      bureauScore: trader?.creditData?.creditScore || 0,
+      hasDefaultHistory: (trader?.creditData?.overdueLoans || 0) > 0,
     }),
   });
 
@@ -402,11 +404,62 @@ async function checkLoanRepayments(db, userId, todayRevenue, today) {
         }
       }
 
+      // Detect fully repaid — write the critical ML training label
+      const allRepaySnap = await db.collection('loan_repayments')
+        .doc(loanDoc.id).collection('schedule').get();
+      if (!allRepaySnap.empty && allRepaySnap.docs.every(d => d.data().status === 'paid')) {
+        await db.collection('loanApplications').doc(loanDoc.id)
+          .update({ status: 'repaid', repaidAt: Date.now() });
+        await db.collection('ml_features').doc(userId)
+          .collection('daily').doc(today)
+          .set({ loanOutcome: 'repaid' }, { merge: true });
+        console.log(`[agent] Loan ${loanDoc.id} fully repaid — ML label written for ${userId}`);
+        continue;
+      }
+
       if (todayRevenue > (loanData.monthlyRepayment || 0) * 1.5) {
         await sendRepaymentPrompt(db, userId, loanData);
       }
     } catch (e) {
       console.error(`[agent] Repayment check error for loan ${loanData.id}:`, e.message);
+    }
+  }
+}
+
+// ─── SCF AUTO-DEDUCTION ──────────────────────────────────────────────────────
+
+async function autoDeductSCF(db, userId, todayRevenue, today) {
+  if (todayRevenue <= 0) return;
+
+  const activeSnap = await db.collection('scf_records')
+    .where('userId', '==', userId)
+    .where('status', '==', 'active')
+    .get();
+
+  if (activeSnap.empty) return;
+
+  for (const guaranteeDoc of activeSnap.docs) {
+    const record = guaranteeDoc.data();
+    const deduction = Math.round(todayRevenue * (record.autoDeductRate || 0.15));
+    if (deduction <= 0) continue;
+
+    const newRepaid = (record.repaidAmount || 0) + deduction;
+    const fullyRepaid = newRepaid >= record.goodsValue;
+
+    await guaranteeDoc.ref.update({
+      repaidAmount: newRepaid,
+      status: fullyRepaid ? 'repaid' : 'active',
+      lastRepaymentAt: Date.now(),
+      ...(fullyRepaid ? { repaidAt: Date.now() } : {}),
+    });
+
+    if (fullyRepaid) {
+      await db.collection('ml_features').doc(userId)
+        .collection('daily').doc(today)
+        .set({ scfOutcome: 'repaid' }, { merge: true });
+      console.log(`[supply] SCF ${guaranteeDoc.id} auto-repaid for ${userId}`);
+    } else {
+      console.log(`[supply] SCF ${guaranteeDoc.id} deducted ${deduction} for ${userId} — remaining: ${record.goodsValue - newRepaid}`);
     }
   }
 }
@@ -457,7 +510,7 @@ async function runNightlyAgent() {
 
       // Stage 6: Call Python ML service for secondary score (non-fatal)
       try {
-        await callMLService(db, userId, transactions, publicScore, today);
+        await callMLService(db, userId, transactions, publicScore, today, trader);
       } catch (e) {
         console.error(`[ml] ML service call failed for ${userId}:`, e.message);
       }
@@ -471,6 +524,13 @@ async function runNightlyAgent() {
         await checkLoanRepayments(db, userId, todayRevenue, today);
       } catch (e) {
         console.error(`[agent] Repayment check failed for ${userId}:`, e.message);
+      }
+
+      // Auto-deduct 15% of today's revenue toward active SCF guarantees (non-fatal)
+      try {
+        await autoDeductSCF(db, userId, todayRevenue, today);
+      } catch (e) {
+        console.error(`[supply] SCF auto-deduct failed for ${userId}:`, e.message);
       }
 
       // Get previous score

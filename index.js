@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const cron = require('node-cron');
+const { stampVerification } = require('./services/verification');
 
 const monoRoutes = require('./routes/mono');
 const authRoutes = require('./routes/auth');
@@ -14,7 +14,9 @@ const bureauRoutes = require('./routes/bureau');
 const accountRoutes = require('./routes/account');
 const mfbRoutes = require('./routes/mfb');
 const supplyChainRoutes = require('./routes/supplyChain');
-const { startLoanDecisionListener } = require('./utils/loanNotifier');
+const creditApiV1 = require('./routes/api/v1');
+const exportRoutes = require('./routes/export');
+const passportRoutes = require('./routes/passports');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,10 +45,13 @@ app.get('/pay/:slug', (req, res) => {
   <title>Pay ${businessName} — TRADR</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:system-ui,-apple-system,sans-serif;background:#0A1628;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    body{font-family:system-ui,-apple-system,sans-serif;background:#0A1628;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px}
+    @media(min-height:760px) and (min-width:480px){body{align-items:center}}
+    @media(max-width:400px){body{padding:24px 14px}}
     .card{background:#111827;border-radius:24px;padding:36px 24px;max-width:420px;width:100%;text-align:center}
+    @media(max-width:400px){.card{padding:28px 18px;border-radius:18px}}
     .logo{color:#1B4FDB;font-size:13px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:24px}
-    h1{color:#fff;font-size:26px;font-weight:700;margin-bottom:8px}
+    h1{color:#fff;font-size:26px;font-weight:700;margin-bottom:8px;word-break:break-word}
     .sub{color:#6B7280;font-size:14px;margin-bottom:28px}
     .steps{background:#0A1628;border-radius:16px;padding:20px;text-align:left;margin-bottom:24px}
     .step{display:flex;gap:14px;align-items:flex-start;margin-bottom:14px}
@@ -116,6 +121,12 @@ app.get('/pay/:slug', (req, res) => {
     <div class="note">
       <span class="badge">TRADR</span> helps Nigerian traders build a verified financial identity. Every digital payment builds their business credit score and gets them closer to a business loan.
     </div>
+
+    <div style="margin-top:20px;padding:14px;background:#060E1A;border-radius:12px;text-align:center">
+      <p style="color:#4A5A75;font-size:12px;margin-bottom:8px">Powered by <strong style="color:#1B4FDB">TRADR</strong></p>
+      <p style="color:#6B7280;font-size:11px;line-height:1.7">Record your sales every day, build your business credit score, and unlock a loan — no collateral needed.</p>
+      <a href="https://tradr-landing-iota.vercel.app" style="display:inline-block;margin-top:12px;background:#1B4FDB;color:#fff;text-decoration:none;border-radius:8px;padding:8px 18px;font-size:12px;font-weight:700">Get TRADR Free →</a>
+    </div>
   </div>
 
   <script>
@@ -179,6 +190,7 @@ app.post('/pay/:slug/confirm', async (req, res) => {
       description: description || `Customer payment via TRADR Link`,
       type: 'sale',
       source: 'customer_link',
+      verification: stampVerification('customer_link'),
       status: 'pending',
       slug,
       createdAt: Date.now(),
@@ -206,6 +218,15 @@ app.post('/pay/:slug/confirm', async (req, res) => {
   }
 });
 
+// Credit API v1 — partner-key-gated, separate trust domain from Firebase-auth app routes
+app.use('/api/v1', creditApiV1);
+
+// Data export — signed-token gated, no login required
+app.use('/export', exportRoutes);
+
+// Passport verification — fully public, intentionally unauthenticated
+app.use('/', passportRoutes);
+
 // Routes
 app.use('/mono', monoRoutes);
 app.use('/auth', authRoutes);
@@ -219,27 +240,42 @@ app.use('/account', accountRoutes);
 app.use('/mfb', mfbRoutes);
 app.use('/supply', supplyChainRoutes);
 
-// Nightly agent — midnight Lagos time
-cron.schedule('0 0 * * *', async () => {
-  console.log('[cron] Running nightly TRADR agent...');
+// Cron endpoints — called by Vercel Cron (vercel.json) on schedule
+// /cron/nightly  → 0 23 * * * UTC  (midnight Lagos, UTC+1)
+// /cron/morning  → 30 5 * * * UTC  (6:30am Lagos, UTC+1)
+app.get('/cron/nightly', async (req, res) => {
+  if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
+    return res.status(401).end();
+  }
   try {
     await runNightlyAgent();
+    res.json({ ok: true });
   } catch (e) {
     console.error('[cron] Nightly agent failed:', e.message);
+    res.status(500).json({ error: e.message });
   }
-}, { timezone: 'Africa/Lagos' });
+});
 
-// Morning messages — 6:30am Lagos time
-cron.schedule('30 6 * * *', async () => {
-  console.log('[cron] Sending morning messages...');
+app.get('/cron/morning', async (req, res) => {
+  if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
+    return res.status(401).end();
+  }
   try {
     await sendMorningMessages();
+    res.json({ ok: true });
   } catch (e) {
     console.error('[cron] Morning messages failed:', e.message);
+    res.status(500).json({ error: e.message });
   }
-}, { timezone: 'Africa/Lagos' });
-
-app.listen(PORT, () => {
-  console.log(`TRADR server listening on port ${PORT}`);
-  startLoanDecisionListener();
 });
+
+// Export for Vercel serverless; listen only when run directly (local dev)
+if (require.main === module) {
+  const { startLoanDecisionListener } = require('./utils/loanNotifier');
+  app.listen(PORT, () => {
+    console.log(`TRADR server listening on port ${PORT}`);
+    startLoanDecisionListener();
+  });
+}
+
+module.exports = app;

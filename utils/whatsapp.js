@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { withGrowthFooter, logGrowthTouch } = require('../services/growthFooter');
 
 const WA_API = 'https://graph.facebook.com/v18.0';
 
@@ -87,7 +88,46 @@ async function sendDebtReminder({
     }
   }
 
-  return sendWhatsAppMessage(debtorPhone, message);
+  const withFooter = withGrowthFooter(message, language);
+  logGrowthTouch('debt_reminder', null).catch(() => {});
+  return sendWhatsAppMessage(debtorPhone, withFooter);
 }
 
-module.exports = { sendWhatsAppMessage, sendWhatsAppTemplate, sendDebtReminder };
+/**
+ * Upload a buffer as a WhatsApp media document, then send it to a number.
+ * Uses the Meta Graph API media upload + document message flow.
+ */
+async function sendWhatsAppDocument(to, buffer, filename, caption) {
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  const token   = process.env.WHATSAPP_TOKEN;
+  if (!phoneId || !token) throw new Error('WhatsApp credentials not configured');
+
+  // Step 1 — upload the buffer to the Media API
+  const FormData = require('form-data');
+  const form = new FormData();
+  form.append('file', buffer, { filename, contentType: 'application/pdf' });
+  form.append('messaging_product', 'whatsapp');
+
+  const uploadRes = await axios.post(
+    `${WA_API}/${phoneId}/media`,
+    form,
+    { headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` } }
+  );
+  const mediaId = uploadRes.data?.id;
+  if (!mediaId) throw new Error('Media upload failed — no media_id returned');
+
+  // Step 2 — send document message referencing the uploaded media
+  const response = await axios.post(
+    `${WA_API}/${phoneId}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'document',
+      document: { id: mediaId, filename, caption: caption || '' },
+    },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+  return response.data;
+}
+
+module.exports = { sendWhatsAppMessage, sendWhatsAppTemplate, sendDebtReminder, sendWhatsAppDocument };

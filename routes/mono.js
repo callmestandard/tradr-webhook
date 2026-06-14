@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const { stampVerification } = require('../services/verification');
 const admin = require('../firebaseAdmin');
 
 const router = express.Router();
@@ -128,6 +129,7 @@ async function seedHistoricalTransactions(accountId, userId) {
       narration: tx.narration || '',
       type: 'credit',
       source: 'mono_auto',
+      verification: stampVerification('mono_auto'),
       status: 'pending',
       bankName: bankName || '',
       createdAt: Date.now(),
@@ -178,6 +180,7 @@ async function processAccountUpdatedWebhook(payload) {
       narration: tx.narration || '',
       type: 'credit',
       source: 'mono_auto',
+      verification: stampVerification('mono_auto'),
       status: 'pending',
       bankName: bankName || '',
       createdAt: Date.now(),
