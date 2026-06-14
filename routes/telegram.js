@@ -1,7 +1,13 @@
 const express = require('express');
-const { sendTelegramMessage } = require('../utils/telegram');
+const { sendTelegramMessage, sendTelegramDocument } = require('../utils/telegram');
 const { stampVerification } = require('../services/verification');
+const { createSignedToken, generatePDFStatement } = require('../services/exporter');
+const { withGrowthFooter, logGrowthTouch } = require('../services/growthFooter');
 const admin = require('../firebaseAdmin');
+
+const SERVER_URL      = process.env.SERVER_URL || 'https://tradr-webhook.onrender.com';
+const EXPORT_COMMANDS  = new Set(['EXPORT', 'SEND MY RECORDS', 'MY RECORDS', 'EXPORT DATA']);
+const PASSPORT_COMMANDS = new Set(['PASSPORT', 'MY PASSPORT', 'LOAN CARD', 'CREDIT CARD', 'KAADI', 'PASSPO']);
 
 const router = express.Router();
 
@@ -202,8 +208,91 @@ router.post('/webhook', async (req, res) => {
 
     if (upper === 'HELP' || upper === 'COMMANDS' || upper === '?') {
       await sendTelegramMessage(chatId,
-        `*TRADR Bot* 💬\n\n*Record a sale:*\n5000\nsold rice 5000\nsale ankara 8,500\n\n*Record expense:*\nexpense transport 800\nspent 5000 stock\nbought restock 20000\n\n*Check numbers:*\nTODAY — today's sales\nWEEK — this week\nSCORE — your TRADR Score\nHELP — this menu\n\n*Ask anything:*\n"what is my best selling product?"\n"how much profit did I make this month?"\n\n— TRADR`
+        `*TRADR Bot* 💬\n\n*Record a sale:*\n5000\nsold rice 5000\nsale ankara 8,500\n\n*Record expense:*\nexpense transport 800\nspent 5000 stock\nbought restock 20000\n\n*Check numbers:*\nTODAY — today's sales\nWEEK — this week\nSCORE — your TRADR Score\nHELP — this menu\n\n*Loan requests:*\nYES TRADR — allow a lender to view your profile\nNO TRADR — decline a lender request\n\n*Your records:*\nEXPORT — get your business statement + download link\nPASSPORT — get your shareable credit passport\n\n*Ask anything:*\n"what is my best selling product?"\n"how much profit did I make this month?"\n\n— TRADR`
       );
+      return;
+    }
+
+    // ── YES TRADR / NO TRADR — lender data consent ──
+    if (upper === 'YES TRADR' || upper === 'NO TRADR') {
+      const approved = upper === 'YES TRADR';
+      const now = Date.now();
+      const pendingSnap = await db.collection('consent_requests')
+        .where('trader_id', '==', userId)
+        .where('status', '==', 'pending')
+        .get().catch(() => ({ empty: true, docs: [] }));
+
+      const activePending = (pendingSnap.docs || []).filter(d => d.data().expires_at > now);
+
+      if (activePending.length === 0) {
+        await sendTelegramMessage(chatId, 'No active data access requests found for your account. — TRADR');
+        return;
+      }
+
+      const batch = db.batch();
+      const partnerNames = [];
+      const partnerIds = [];
+      for (const reqDoc of activePending) {
+        const reqData = reqDoc.data();
+        partnerNames.push(reqData.partner_name);
+        partnerIds.push(reqData.partner_id);
+        batch.update(reqDoc.ref, { status: approved ? 'granted' : 'denied', responded_at: now });
+      }
+      await batch.commit();
+
+      if (approved) {
+        const traderRef = db.collection('traders').doc(userId);
+        const traderSnap = await traderRef.get();
+        const existing = traderSnap.data()?.apiConsent?.partners || [];
+        await traderRef.update({
+          'apiConsent.granted': true,
+          'apiConsent.partners': [...new Set([...existing, ...partnerIds])],
+          'apiConsent.lastUpdated': now,
+        });
+        await sendTelegramMessage(chatId,
+          `✅ *Access granted!*\n\n*${partnerNames.join(', ')}* can now view your TRADR profile to check your loan eligibility.\n\nYou can revoke this any time from the TRADR app. — TRADR`
+        );
+      } else {
+        await sendTelegramMessage(chatId,
+          `❌ *Access declined.*\n\n*${partnerNames.join(', ')}* will not be able to view your TRADR profile.\n\nYou can start a new loan application any time in the TRADR app. — TRADR`
+        );
+      }
+      return;
+    }
+
+    // ── EXPORT ──
+    if (EXPORT_COMMANDS.has(upper)) {
+      try {
+        const pdfBuffer = await generatePDFStatement(userId, 3);
+        const token = createSignedToken(userId, 'csv');
+        const downloadUrl = `${SERVER_URL}/export/${token}`;
+        await sendTelegramDocument(chatId, pdfBuffer, 'tradr-statement.pdf',
+          `📊 *Your TRADR Business Statement*\n\nCovers your last 3 months — revenue, expenses, profit, and outstanding debts.\n\nFull transaction history (CSV, valid 24h):\n${downloadUrl}\n\n— TRADR`
+        );
+      } catch (e) {
+        console.error('[telegram] EXPORT error:', e.message);
+        await sendTelegramMessage(chatId, 'Could not generate your export right now. Please try again in a few minutes. — TRADR');
+      }
+      return;
+    }
+
+    // ── PASSPORT ──
+    if (PASSPORT_COMMANDS.has(upper)) {
+      try {
+        const { generatePassport } = require('../services/passport');
+        const result = await generatePassport(userId);
+        if (result.rateLimited) {
+          await sendTelegramMessage(chatId, 'You have already generated 3 passports today. Try again tomorrow. — TRADR');
+          return;
+        }
+        const verifyUrl = `${SERVER_URL}/verify/${result.passportId}`;
+        await sendTelegramDocument(chatId, result.pdfBuffer, 'tradr-credit-passport.pdf',
+          `🪪 *Your TRADR Credit Passport*\n\nShare this with any lender or bank — no bank statement needed.\n\nLenders can verify online: ${verifyUrl}\n\nValid for 30 days. — TRADR`
+        );
+      } catch (e) {
+        console.error('[telegram] PASSPORT error:', e.message);
+        await sendTelegramMessage(chatId, 'Could not generate your passport right now. Try again in a few minutes. — TRADR');
+      }
       return;
     }
 
@@ -215,9 +304,11 @@ router.post('/webhook', async (req, res) => {
       const verb = parsed.type === 'sale' ? '💰 Sale' : '💸 Expense';
       const descLine = (parsed.description !== 'Sale' && parsed.description !== 'Expense')
         ? `\n${parsed.description}` : '';
-      await sendTelegramMessage(chatId,
+      const receiptMsg = withGrowthFooter(
         `✅ *${verb} recorded — ${fmt(parsed.amount)}*${descLine}\n\n📊 Today: ${fmt(stats.todaySales)} in • ${fmt(stats.todayExpenses)} out\n📈 Profit: ${fmt(stats.net)}\n\nOpen TRADR app to see full breakdown. — TRADR`
       );
+      await sendTelegramMessage(chatId, receiptMsg);
+      logGrowthTouch('telegram_receipt', userId).catch(() => {});
       return;
     }
 
